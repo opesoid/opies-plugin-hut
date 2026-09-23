@@ -1,6 +1,5 @@
 # Opie Plugin Library
-
-RuneLite plugins with a Windows setup window that installs or removes the set you choose.
+Plugins with a Windows setup window that installs or removes the set you choose.
 
 Each plugin is its own jar. The client loads them from your local plugin folder the next time it starts. The jars in `dist/` are already built, so installing does not require a JDK.
 
