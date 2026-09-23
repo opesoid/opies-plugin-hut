@@ -33,7 +33,7 @@ import java.awt.event.MouseEvent;
 @Slf4j
 public class OpiesBankSorterPlugin extends Plugin {
     static final String CONFIG = "opiebanksorter";
-    public static final String version = "2.3.1";
+    public static final String version = "2.3.2";
 
     @Inject
     private OverlayManager overlayManager;
