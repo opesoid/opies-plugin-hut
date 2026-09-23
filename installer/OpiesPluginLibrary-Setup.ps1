@@ -3,6 +3,7 @@
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $ErrorActionPreference = 'Stop'
 
@@ -48,6 +49,13 @@ $script:ColorInstalled = [System.Drawing.Color]::FromArgb(52, 211, 153)
 $script:ColorWarning = [System.Drawing.Color]::FromArgb(251, 191, 36)
 $script:ColorLog = [System.Drawing.Color]::FromArgb(14, 14, 16)
 
+$script:HashCache = @{}
+$script:SourceMetaCache = @{}
+$script:JarVersionCache = @{}
+$script:ShortcutFileName = '[OPIE] Plugin Library.lnk'
+$script:LauncherDir = Join-Path $env:LOCALAPPDATA 'OpiesPluginLibrary'
+$script:RunScriptUri = 'https://raw.githubusercontent.com/opesoid/opies-plugin-hut/dev/installer/run.ps1'
+
 $script:PluginBlurbs = @{
     'OpiesBankSorterPlugin.jar' = 'Sorts the bank into an iron 8-tab layout.'
     'OpiesSandBuyerPlugin.jar' = 'Buys sand and soda ash in Catherby, then hops.'
@@ -90,11 +98,11 @@ function Test-ClientRunning {
 }
 
 function Get-InstalledCopy([string] $jarName) {
-    $found = @()
+    $found = New-Object System.Collections.Generic.List[object]
     foreach ($path in (Get-InstalledJarPaths $jarName)) {
-        $found += Get-Item -LiteralPath $path
+        [void] $found.Add((Get-Item -LiteralPath $path))
     }
-    return @($found)
+    Write-Output -NoEnumerate $found
 }
 
 function Get-InstalledJarPaths([string] $jarName) {
@@ -108,7 +116,177 @@ function Get-InstalledJarPaths([string] $jarName) {
             }
         }
     }
-    return $paths
+    Write-Output -NoEnumerate $paths
+}
+
+function Get-CachedFileHash([string] $path) {
+    $item = Get-Item -LiteralPath $path
+    $key = '{0}|{1}|{2}' -f $item.FullName, $item.Length, $item.LastWriteTimeUtc.Ticks
+    if ($script:HashCache.ContainsKey($key)) {
+        return $script:HashCache[$key]
+    }
+    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    $script:HashCache[$key] = $hash
+    return $hash
+}
+
+function Get-PluginSourceMeta([string] $jarName) {
+    if ($script:SourceMetaCache.ContainsKey($jarName)) {
+        return $script:SourceMetaCache[$jarName]
+    }
+    $meta = @{
+        Version = $null
+        MinClient = $null
+    }
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($jarName)
+    $srcRoot = Join-Path $RepoRoot 'src'
+    if (Test-Path -LiteralPath $srcRoot) {
+        $file = Get-ChildItem -LiteralPath $srcRoot -Filter ($stem + '.java') -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $file) {
+            $text = Get-Content -LiteralPath $file.FullName -Raw
+            if ($text -match 'public static final String version = "([^"]+)"') {
+                $meta.Version = $Matches[1]
+            }
+            if ($text -match 'minClientVersion = "([^"]+)"') {
+                $meta.MinClient = $Matches[1]
+            }
+        }
+    }
+    $script:SourceMetaCache[$jarName] = $meta
+    return $meta
+}
+
+function Get-AvailablePluginVersion([string] $jarName) {
+    return (Get-PluginSourceMeta $jarName).Version
+}
+
+function Get-JarVersionStrings([string] $jarPath) {
+    $item = Get-Item -LiteralPath $jarPath
+    $key = '{0}|{1}|{2}' -f $item.FullName, $item.Length, $item.LastWriteTimeUtc.Ticks
+    if ($script:JarVersionCache.ContainsKey($key)) {
+        Write-Output -NoEnumerate @($script:JarVersionCache[$key])
+        return
+    }
+    $found = New-Object System.Collections.Generic.List[string]
+    try {
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
+        try {
+            $encoding = [System.Text.Encoding]::GetEncoding(28591)
+            foreach ($entry in $zip.Entries) {
+                if (-not $entry.FullName.EndsWith('Plugin.class')) { continue }
+                if ($entry.FullName.Contains('$')) { continue }
+                $stream = $entry.Open()
+                try {
+                    $memory = New-Object System.IO.MemoryStream
+                    $stream.CopyTo($memory)
+                    $bytes = $memory.ToArray()
+                    $memory.Dispose()
+                } finally {
+                    $stream.Dispose()
+                }
+                $text = $encoding.GetString($bytes)
+                foreach ($match in [regex]::Matches($text, '\d+\.\d+\.\d+')) {
+                    $value = $match.Value
+                    if (-not $found.Contains($value)) {
+                        [void] $found.Add($value)
+                    }
+                }
+            }
+        } finally {
+            $zip.Dispose()
+        }
+    } catch {
+        $script:JarVersionCache[$key] = @()
+        Write-Output -NoEnumerate $found
+        return
+    }
+    $script:JarVersionCache[$key] = $found.ToArray()
+    Write-Output -NoEnumerate $found
+}
+
+function Get-InstalledPluginVersion([string] $jarName, [string] $availableVersion) {
+    $minClient = (Get-PluginSourceMeta $jarName).MinClient
+    foreach ($file in (Get-InstalledCopy $jarName)) {
+        $versions = Get-JarVersionStrings $file.FullName
+        if ($versions.Count -eq 0) { continue }
+        if ($availableVersion -and ($versions -contains $availableVersion)) {
+            return $availableVersion
+        }
+        foreach ($value in $versions) {
+            if ($value -eq $availableVersion) { continue }
+            if ($minClient -and ($value -eq $minClient)) { continue }
+            return $value
+        }
+    }
+    return $null
+}
+
+function Test-PluginNeedsUpdate([string] $jarName) {
+    $source = Join-Path $DistDir $jarName
+    if (-not (Test-Path -LiteralPath $source)) { return $false }
+    $installed = Get-InstalledCopy $jarName
+    if ($installed.Count -eq 0) { return $false }
+    try {
+        $sourceHash = Get-CachedFileHash $source
+        foreach ($file in $installed) {
+            if ((Get-CachedFileHash $file.FullName) -ne $sourceHash) {
+                return $true
+            }
+        }
+    } catch {
+        return $true
+    }
+    return $installed.Count -gt 1
+}
+
+function Get-DesktopShortcutPath {
+    return (Join-Path ([Environment]::GetFolderPath('Desktop')) $script:ShortcutFileName)
+}
+
+function Test-DesktopShortcut {
+    return (Test-Path -LiteralPath (Get-DesktopShortcutPath))
+}
+
+function Add-DesktopShortcut {
+    if (-not (Test-Path -LiteralPath $script:LauncherDir)) {
+        New-Item -ItemType Directory -Path $script:LauncherDir | Out-Null
+    }
+    $vbs = Join-Path $script:LauncherDir 'Open-Installer.vbs'
+    $launcher = @(
+        "' Opens the latest [OPIE] Plugin Library installer.",
+        'Set shell = CreateObject("Wscript.Shell")',
+        ('command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ""irm {0} | iex"""' -f $script:RunScriptUri),
+        'shell.Run command, 0, False'
+    ) -join "`r`n"
+    Set-Content -LiteralPath $vbs -Value $launcher -Encoding ASCII
+    $wsh = New-Object -ComObject WScript.Shell
+    $shortcut = $wsh.CreateShortcut((Get-DesktopShortcutPath))
+    $shortcut.TargetPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
+    $shortcut.Arguments = "//nologo `"$vbs`""
+    $shortcut.WorkingDirectory = $script:LauncherDir
+    $shortcut.WindowStyle = 7
+    $shortcut.Description = 'Open the [OPIE] Plugin Library installer'
+    $shortcut.IconLocation = ((Join-Path $env:SystemRoot 'System32\imageres.dll') + ',109')
+    $shortcut.Save()
+}
+
+function Remove-DesktopShortcut {
+    $path = Get-DesktopShortcutPath
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force
+    }
+}
+
+function Update-ShortcutLink($link) {
+    if ($null -eq $link) { return }
+    if (Test-DesktopShortcut) {
+        $link.Text = 'Remove desktop shortcut'
+        $link.ForeColor = $script:ColorMuted
+    } else {
+        $link.Text = 'Add desktop shortcut'
+        $link.ForeColor = $script:ColorAccent
+    }
 }
 
 function Remove-LibraryJars([string[]] $jarNames) {
@@ -268,6 +446,8 @@ function Build-PluginCards($form) {
             JarName = $jarName
             Checked = [bool] $available
             Available = [bool] $available
+            AvailableVersion = (Get-AvailablePluginVersion $jarName)
+            HasUpdate = $false
         }
         Set-ControlBuffered $card
         $card.Add_Paint({
@@ -369,28 +549,123 @@ function Build-PluginCards($form) {
 function Update-PluginCardStatus($form) {
     $cards = $form.Tag['Cards']
     if ($null -eq $cards) { return }
+    $updateCount = 0
+    $updateLabels = New-Object System.Collections.Generic.List[string]
     foreach ($card in $cards) {
         $status = $card.Controls['status']
+        $detail = $card.Controls['detail']
         if ($null -eq $status) { continue }
+        $jarName = $card.Tag.JarName
+        $blurb = $script:PluginBlurbs[$jarName]
+        if (-not $blurb) { $blurb = 'Library plugin' }
+        $availableVersion = $card.Tag.AvailableVersion
+        $needsUpdate = $false
         if (-not $card.Tag.Available) {
             $status.Text = 'Missing'
             $status.ForeColor = $script:ColorWarning
-        } elseif (@(Get-InstalledCopy $card.Tag.JarName).Count -gt 0) {
+            if ($null -ne $detail) { $detail.Text = "$blurb   Missing from dist" }
+        } elseif (Test-PluginNeedsUpdate $jarName) {
+            $needsUpdate = $true
+            $updateCount += 1
+            [void] $updateLabels.Add((Get-PluginLabel $jarName))
+            $status.Text = 'Update available'
+            $status.ForeColor = $script:ColorWarning
+            $installedVersion = Get-InstalledPluginVersion $jarName $availableVersion
+            if ($installedVersion -and $availableVersion -and ($installedVersion -ne $availableVersion)) {
+                if ($null -ne $detail) { $detail.Text = "$blurb   $installedVersion  ->  $availableVersion" }
+            } elseif ($availableVersion) {
+                if ($null -ne $detail) { $detail.Text = "$blurb   Newer copy available (latest $availableVersion)" }
+            } else {
+                if ($null -ne $detail) { $detail.Text = "$blurb   Newer copy available" }
+            }
+        } elseif ((Get-InstalledCopy $jarName).Count -gt 0) {
             $status.Text = 'Installed'
             $status.ForeColor = $script:ColorInstalled
+            if ($null -ne $detail) {
+                if ($availableVersion) {
+                    $detail.Text = "$blurb   v$availableVersion"
+                } else {
+                    $source = Join-Path $DistDir $jarName
+                    $file = Get-Item -LiteralPath $source
+                    $detail.Text = "$blurb   $(Format-Stamp $file)"
+                }
+            }
         } else {
             $status.Text = 'Not installed'
             $status.ForeColor = $script:ColorMuted
+            if ($null -ne $detail) {
+                $source = Join-Path $DistDir $jarName
+                $file = Get-Item -LiteralPath $source
+                if ($availableVersion) {
+                    $detail.Text = "$blurb   v$availableVersion   $(Format-Stamp $file)"
+                } else {
+                    $detail.Text = "$blurb   $(Format-Stamp $file)"
+                }
+            }
         }
+        $card.Tag.HasUpdate = $needsUpdate
         $status.Location = New-Object System.Drawing.Point(($card.Width - $status.Width - 18), 32)
     }
     $checked = @(Get-CheckedJarNames $form)
     $form.Tag.InstallButton.Enabled = $checked.Count -gt 0
     $form.Tag.UninstallButton.Enabled = $checked.Count -gt 0
+    if ($null -ne $form.Tag.UpdateLink) {
+        if ($updateCount -gt 0) {
+            $form.Tag.UpdateLink.ForeColor = $script:ColorAccent
+            $form.Tag.UpdateLink.Cursor = [System.Windows.Forms.Cursors]::Hand
+        } else {
+            $form.Tag.UpdateLink.ForeColor = $script:ColorMuted
+            $form.Tag.UpdateLink.Cursor = [System.Windows.Forms.Cursors]::Default
+        }
+    }
     if (Test-ClientRunning) {
         $form.Tag.Warning.Text = 'The game client is running. Close it before Install or Uninstall.'
+    } elseif ($updateCount -eq 1) {
+        $form.Tag.Warning.Text = "$($updateLabels[0]) has an update."
+    } elseif ($updateCount -gt 1) {
+        $names = $updateLabels.ToArray() -join ', '
+        $form.Tag.Warning.Text = "$updateCount plugins have updates: $names."
     } else {
         $form.Tag.Warning.Text = ''
+    }
+}
+
+function Invoke-InstallPlugins($form, $log, [string[]] $names) {
+    if ($names.Count -eq 0) { return $false }
+    if (Test-ClientRunning) {
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            'Close the game client first so the old plugin files can be deleted.',
+            'Client is running',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return $false
+    }
+    try {
+        $hadUpdates = @($names | Where-Object { Test-PluginNeedsUpdate $_ }).Count -gt 0
+        $result = Install-Library $names
+        foreach ($path in $result.Removed) { Write-Log $log "Removed old copy: $path" }
+        foreach ($path in $result.Installed) { Write-Log $log "Installed: $path" }
+        Write-Log $log 'Restart the client, then enable the [OPIE] plugins you want.'
+        $title = if ($hadUpdates) { 'Installed / updated' } else { 'Installed' }
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            "Installed or updated $($result.Installed.Count) plugin(s).`r`n`r`nRestart the client before using them.",
+            $title,
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        return $true
+    } catch {
+        Write-Log $log $_.Exception.Message
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            $_.Exception.Message,
+            'Install failed',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return $false
+    } finally {
+        Update-PluginCardStatus $form
     }
 }
 
@@ -440,7 +715,7 @@ function New-LibraryForm {
     $title.Location = New-Object System.Drawing.Point(100, 22)
 
     $subtitle = New-Object System.Windows.Forms.Label
-    $subtitle.Text = 'Check the plugins you want. Unchecked plugins stay as they are.'
+    $subtitle.Text = 'Check the plugins you want. Outdated installs are marked so you can update them here.'
     $subtitle.Font = New-Object System.Drawing.Font('Segoe UI', 10)
     $subtitle.ForeColor = $script:ColorMuted
     $subtitle.BackColor = $script:ColorBg
@@ -465,6 +740,15 @@ function New-LibraryForm {
     $clearSelection.AutoSize = $true
     $clearSelection.Cursor = [System.Windows.Forms.Cursors]::Hand
     $clearSelection.Location = New-Object System.Drawing.Point(108, 128)
+
+    $updateOutdated = New-Object System.Windows.Forms.Label
+    $updateOutdated.Text = 'Update outdated'
+    $updateOutdated.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+    $updateOutdated.ForeColor = $script:ColorMuted
+    $updateOutdated.BackColor = $script:ColorBg
+    $updateOutdated.AutoSize = $true
+    $updateOutdated.Cursor = [System.Windows.Forms.Cursors]::Default
+    $updateOutdated.Location = New-Object System.Drawing.Point(160, 128)
 
     $list = New-Object System.Windows.Forms.Panel
     $list.Location = New-Object System.Drawing.Point(20, 160)
@@ -500,14 +784,23 @@ function New-LibraryForm {
     $log.Location = New-Object System.Drawing.Point(28, 510)
     $log.Size = New-Object System.Drawing.Size(704, 92)
 
-    $installButton = New-SetupButton 'Install selected' 'primary'
-    $installButton.Location = New-Object System.Drawing.Point(336, 620)
+    $shortcutLink = New-Object System.Windows.Forms.Label
+    $shortcutLink.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+    $shortcutLink.BackColor = $script:ColorBg
+    $shortcutLink.AutoSize = $true
+    $shortcutLink.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $shortcutLink.Location = New-Object System.Drawing.Point(28, 630)
+    Update-ShortcutLink $shortcutLink
+
+    $installButton = New-SetupButton 'Install / Update' 'primary'
+    $installButton.Size = New-Object System.Drawing.Size(158, 40)
+    $installButton.Location = New-Object System.Drawing.Point(320, 620)
 
     $uninstallButton = New-SetupButton 'Uninstall selected' 'danger'
-    $uninstallButton.Location = New-Object System.Drawing.Point(492, 620)
+    $uninstallButton.Location = New-Object System.Drawing.Point(486, 620)
 
     $closeButton = New-SetupButton 'Close' 'quiet'
-    $closeButton.Location = New-Object System.Drawing.Point(636, 620)
+    $closeButton.Location = New-Object System.Drawing.Point(642, 620)
     $closeButton.Add_Click({ $form.Close() }.GetNewClosure())
 
     $cards = New-Object System.Collections.Generic.List[object]
@@ -516,6 +809,8 @@ function New-LibraryForm {
         List = $list
         InstallButton = $installButton
         UninstallButton = $uninstallButton
+        UpdateLink = $updateOutdated
+        ShortcutLink = $shortcutLink
         Warning = $warning
     }
 
@@ -535,40 +830,49 @@ function New-LibraryForm {
         Update-PluginCardStatus $form
     }.GetNewClosure())
 
-    $installButton.Add_Click({
+    $updateOutdated.Add_Click({
         Update-PluginCardStatus $form
-        $names = @(Get-CheckedJarNames $form)
-        if ($names.Count -eq 0) { return }
-        if (Test-ClientRunning) {
-            [System.Windows.Forms.MessageBox]::Show(
-                $form,
-                'Close the game client first so the old plugin files can be deleted.',
-                'Client is running',
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        $names = New-Object System.Collections.Generic.List[string]
+        foreach ($card in $form.Tag['Cards']) {
+            $hasUpdate = [bool] $card.Tag.HasUpdate
+            $card.Tag.Checked = $hasUpdate
+            $card.Invalidate()
+            if ($hasUpdate) { [void] $names.Add($card.Tag.JarName) }
+        }
+        Update-PluginCardStatus $form
+        if ($names.Count -eq 0) {
+            Write-Log $log 'No installed plugins have updates.'
             return
         }
+        [void] (Invoke-InstallPlugins $form $log $names.ToArray())
+    }.GetNewClosure())
+
+    $shortcutLink.Add_Click({
         try {
-            $result = Install-Library $names
-            foreach ($path in $result.Removed) { Write-Log $log "Removed old copy: $path" }
-            foreach ($path in $result.Installed) { Write-Log $log "Installed: $path" }
-            Write-Log $log 'Restart the client, then enable the [OPIE] plugins you want.'
-            [System.Windows.Forms.MessageBox]::Show(
-                $form,
-                "Installed $($result.Installed.Count) plugin(s).`r`n`r`nRestart the client before using them.",
-                'Installed',
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            if (Test-DesktopShortcut) {
+                Remove-DesktopShortcut
+                Write-Log $log 'Removed the desktop shortcut.'
+            } else {
+                Add-DesktopShortcut
+                Write-Log $log 'Added a desktop shortcut. It opens the latest installer.'
+            }
         } catch {
             Write-Log $log $_.Exception.Message
             [System.Windows.Forms.MessageBox]::Show(
                 $form,
                 $_.Exception.Message,
-                'Install failed',
+                'Desktop shortcut failed',
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
         }
+        Update-ShortcutLink $shortcutLink
+    }.GetNewClosure())
+
+    $installButton.Add_Click({
         Update-PluginCardStatus $form
+        $names = @(Get-CheckedJarNames $form)
+        if ($names.Count -eq 0) { return }
+        [void] (Invoke-InstallPlugins $form $log $names)
     }.GetNewClosure())
 
     $uninstallButton.Add_Click({
@@ -584,7 +888,7 @@ function New-LibraryForm {
         }
         try {
             $names = @(Get-CheckedJarNames $form)
-            $present = @($names | Where-Object { @(Get-InstalledCopy $_).Count -gt 0 })
+            $present = @($names | Where-Object { (Get-InstalledCopy $_).Count -gt 0 })
             if ($present.Count -eq 0) {
                 Write-Log $log 'None of the selected plugins are installed.'
                 [System.Windows.Forms.MessageBox]::Show(
@@ -618,8 +922,8 @@ function New-LibraryForm {
 
     $header.Controls.AddRange(@($title, $subtitle))
     $form.Controls.AddRange(@(
-        $header, $selectAll, $clearSelection, $list, $warning, $logCaption, $log,
-        $installButton, $uninstallButton, $closeButton
+        $header, $selectAll, $clearSelection, $updateOutdated, $list, $warning, $logCaption, $log,
+        $shortcutLink, $installButton, $uninstallButton, $closeButton
     ))
 
     $timer = New-Object System.Windows.Forms.Timer
@@ -628,7 +932,22 @@ function New-LibraryForm {
     $form.Add_Shown({
         Build-PluginCards $form
         Update-PluginCardStatus $form
-        Write-Log $log 'Check the plugins you want, then install. Unchecked plugins are left alone.'
+        Update-ShortcutLink $shortcutLink
+        Write-Log $log 'Check the plugins you want, then install or update. Unchecked plugins are left alone.'
+        if (Test-DesktopShortcut) {
+            Write-Log $log 'Desktop shortcut is present. Click Remove desktop shortcut to delete it.'
+        } else {
+            Write-Log $log 'Add a desktop shortcut if you want to open this installer later.'
+        }
+        $updateNames = @()
+        foreach ($card in $form.Tag['Cards']) {
+            if ($card.Tag.HasUpdate) { $updateNames += (Get-PluginLabel $card.Tag.JarName) }
+        }
+        if ($updateNames.Count -eq 1) {
+            Write-Log $log "$($updateNames[0]) has an update. Use Update outdated or Install / Update."
+        } elseif ($updateNames.Count -gt 1) {
+            Write-Log $log (("$($updateNames.Count) plugins have updates: " + ($updateNames -join ', ')) + '.')
+        }
         $timer.Start()
     }.GetNewClosure())
     $null = $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() }.GetNewClosure())
