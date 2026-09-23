@@ -1,0 +1,4 @@
+OpiesBankSorterPlugin.jar
+OpiesEclipseRedPlugin.jar
+OpiesMoltenGlassPlugin.jar
+OpiesSandBuyerPlugin.jar

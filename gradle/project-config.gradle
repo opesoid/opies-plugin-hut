@@ -1,0 +1,60 @@
+// JDK and client lookup for the Opie plugin library.
+
+project.ext.TARGET_JDK_VERSION = 11
+project.ext.JDK_VENDOR = 'ADOPTIUM'
+
+project.ext.PLUGINS_SOURCE_PATH = 'src/main/java/net/runelite/client/plugins/microbot'
+project.ext.PLUGINS_RESOURCE_PATH = 'src/main/resources/net/runelite/client/plugins/microbot'
+project.ext.PLUGINS_INCLUDE_PATH = 'net/runelite/client/plugins/microbot'
+
+project.ext.GITHUB_CLIENT_RELEASE_BASE_URL = 'https://github.com/chsami/Microbot/releases/download'
+project.ext.MICROBOT_CLIENT_VERSION_ENDPOINT = 'https://microbot.cloud/api/version/client'
+project.ext.MICROBOT_CLIENT_VERSION = '2.6.9'
+
+project.ext.getPluginsSourcePath = { -> project.ext.PLUGINS_SOURCE_PATH }
+project.ext.getPluginsResourcePath = { -> project.ext.PLUGINS_RESOURCE_PATH }
+project.ext.getPluginsIncludePath = { -> project.ext.PLUGINS_INCLUDE_PATH }
+project.ext.getGithubClientBaseUrl = { -> project.ext.GITHUB_CLIENT_RELEASE_BASE_URL }
+
+project.ext.fetchLatestMicrobotClientVersion = {
+    if (project.gradle.startParameter.offline) {
+        project.logger.warn("Offline mode: cannot fetch latest client version; falling back to default ${project.ext.MICROBOT_CLIENT_VERSION}")
+        return null
+    }
+    try {
+        def url = new URL(project.ext.MICROBOT_CLIENT_VERSION_ENDPOINT)
+        def connection = url.openConnection()
+        connection.setRequestProperty('Accept', 'text/plain')
+        connection.connectTimeout = 5000
+        connection.readTimeout = 5000
+        def latestVersion = connection.inputStream.getText('UTF-8')?.trim()
+        if (latestVersion) {
+            project.logger.lifecycle("Fetched latest client version: ${latestVersion}")
+            return latestVersion
+        }
+    } catch (Exception e) {
+        project.logger.warn("Unable to fetch latest client version: ${e.message}")
+    }
+    return null
+}
+
+project.ext.getMicrobotClientVersion = {
+    def overrideVersion = project.findProperty("clientVersion") ?: project.findProperty("microbotClientVersion")
+    if (overrideVersion) {
+        if (overrideVersion.toString().equalsIgnoreCase("latest")) {
+            def resolved = project.ext.fetchLatestMicrobotClientVersion()
+            if (resolved) {
+                return resolved
+            }
+            project.logger.warn("Falling back to default client version ${project.ext.MICROBOT_CLIENT_VERSION}")
+        } else {
+            return overrideVersion
+        }
+    }
+    def latest = project.ext.fetchLatestMicrobotClientVersion()
+    if (latest) {
+        return latest
+    }
+    project.logger.warn("Falling back to default client version ${project.ext.MICROBOT_CLIENT_VERSION}")
+    return project.ext.MICROBOT_CLIENT_VERSION
+}

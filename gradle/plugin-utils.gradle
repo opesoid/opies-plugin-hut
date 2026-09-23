@@ -1,0 +1,94 @@
+// Discovers plugin packages and gives each one a source set.
+// A plugin package is a directory that contains a *Plugin.java file.
+
+ext {
+    discoverPlugins = { pluginsDir ->
+        def pluginDirs = pluginsDir.listFiles()?.findAll { it.isDirectory() } ?: []
+        def validPlugins = []
+
+        pluginDirs.each { pluginDir ->
+            def pluginJavaFile = pluginDir.listFiles()?.find { file ->
+                file.name.endsWith("Plugin.java")
+            }
+
+            if (pluginJavaFile) {
+                validPlugins << [
+                    dir: pluginDir,
+                    javaFile: pluginJavaFile,
+                    name: pluginJavaFile.name - '.java',
+                    sourceSetName: pluginDir.name
+                ]
+            } else {
+                logger.warn("No Plugin.java file found in ${pluginDir.name}")
+            }
+        }
+
+        return validPlugins
+    }
+
+    configurePluginSourceSet = { plugin ->
+        sourceSets {
+            "${plugin.sourceSetName}" {
+                java {
+                    srcDirs = ["src/main/java"]
+                    include "${project.ext.getPluginsIncludePath()}/PluginConstants.java"
+                    include "${project.ext.getPluginsIncludePath()}/${plugin.dir.name}/**"
+                }
+                resources {
+                    srcDirs = ["src/main/resources"]
+                    include "${project.ext.getPluginsIncludePath()}/${plugin.dir.name}/**"
+                    exclude "**/docs/**"
+                }
+                compileClasspath += configurations.microbotRuntime
+                runtimeClasspath += configurations.microbotRuntime
+            }
+        }
+    }
+
+    configurePluginDependencies = { plugin ->
+        def pluginConfigName = "${plugin.name}ShadowDeps"
+        configurations.create(pluginConfigName) {
+            extendsFrom configurations.pluginShadowClasspath
+        }
+
+        def depsFile = new File(project.rootDir,
+            "${project.ext.getPluginsResourcePath()}/${plugin.dir.name}/dependencies.txt")
+
+        if (depsFile.exists()) {
+            depsFile.readLines().each { dep ->
+                if (dep.trim() && !dep.trim().startsWith('#')) {
+                    logger.lifecycle("Adding dependency for ${plugin.name}: ${dep.trim()}")
+                    dependencies.add(pluginConfigName, dep.trim())
+                }
+            }
+        }
+
+        return pluginConfigName
+    }
+
+    getCommonJarExclusions = {
+        return [
+            'module-info.class',
+            'META-INF/versions/**',
+            'META-INF/INDEX.LIST',
+            'META-INF/*.SF',
+            'META-INF/*.DSA',
+            'META-INF/*.RSA',
+            'META-INF/DEPENDENCIES',
+            'META-INF/LICENSE*',
+            'META-INF/NOTICE*',
+            'META-INF/MANIFEST.MF',
+            'META-INF/native-image/**',
+            'META-INF/services/java.**',
+            'META-INF/services/javax.**',
+            'META-INF/services/sun.**',
+            'META-INF/services/com.sun.**',
+            '**/.gitkeep',
+            '**/.DS_Store',
+            '**/Thumbs.db',
+            '**/module-info.class',
+            '**/docs/**',
+            '**/dependencies.txt',
+        ]
+    }
+}

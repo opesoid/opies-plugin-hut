@@ -1,0 +1,226 @@
+plugins {
+    id 'java'
+    id 'io.freefair.lombok' version '8.6'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+
+apply from: 'gradle/project-config.gradle'
+apply from: 'gradle/plugin-utils.gradle'
+
+def microbotClientVersion = project.ext.getMicrobotClientVersion()
+def microbotClientPath = project.findProperty("clientPath") ?: project.findProperty("microbotClientPath")
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(project.ext.TARGET_JDK_VERSION)
+        vendor = JvmVendorSpec."${project.ext.JDK_VENDOR}"
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = project.ext.TARGET_JDK_VERSION
+    options.compilerArgs.addAll([
+        '-parameters',
+        '-Xlint:none',
+        '-g'
+    ])
+    options.fork = true
+    options.forkOptions.jvmArgs = ['-Dfile.encoding=UTF-8']
+}
+
+configurations {
+    microbotRuntime {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+
+    pluginShadowClasspath {
+        extendsFrom runtimeClasspath
+        exclude group: 'net.runelite', module: 'microbot'
+        exclude group: 'com.microbot', module: 'microbot'
+        exclude group: 'org.projectlombok', module: 'lombok'
+    }
+
+    configureEach {
+        resolutionStrategy {
+            dependencySubstitution {
+                substitute module("com.microbot:client") using module("com.microbot:microbot:${microbotClientVersion}")
+            }
+            eachDependency { details ->
+                if (details.target.group == 'com.microbot' && details.target.name == 'microbot') {
+                    details.artifactSelection {
+                        selectArtifact(DependencyArtifact.DEFAULT_TYPE, null, null)
+                    }
+                }
+            }
+        }
+    }
+}
+
+repositories {
+    ivy {
+        name = "microbot-client-github-releases"
+        url = uri(project.ext.getGithubClientBaseUrl())
+        patternLayout {
+            artifact "[revision]/[module]-[revision].[ext]"
+            artifact "[revision]/microbot-[revision].[ext]"
+        }
+        metadataSources { artifact() }
+    }
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
+    if (microbotClientPath) {
+        def clientFile = file(microbotClientPath)
+        if (!clientFile.exists()) {
+            throw new GradleException("microbotClientPath does not exist: ${clientFile}")
+        }
+        compileOnly files(clientFile)
+        microbotRuntime files(clientFile)
+        testImplementation files(clientFile)
+    } else {
+        compileOnly "com.microbot:microbot:${microbotClientVersion}@jar"
+        microbotRuntime "com.microbot:microbot:${microbotClientVersion}@jar"
+        testImplementation "com.microbot:microbot:${microbotClientVersion}@jar"
+    }
+}
+
+sourceSets {
+    main {
+        java.setSrcDirs([])
+        resources.setSrcDirs([])
+    }
+}
+
+tasks.named('jar') {
+    enabled = false
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+afterEvaluate {
+    if (microbotClientPath) {
+        logger.lifecycle("Client (local path): ${microbotClientPath}")
+    } else {
+        logger.lifecycle("Client version: ${microbotClientVersion}")
+    }
+
+    def pluginsDir = file(project.ext.getPluginsSourcePath())
+    def allPlugins = project.ext.discoverPlugins(pluginsDir)
+    def pluginsProperty = project.findProperty("pluginList")
+    def selectedPluginNames = pluginsProperty ? pluginsProperty.split(',').collect { it.trim() } : []
+
+    def validPlugins = allPlugins.findAll { plugin ->
+        if (selectedPluginNames && !selectedPluginNames.contains(plugin.name)) {
+            logger.lifecycle("Skipping plugin: ${plugin.name}")
+            return false
+        }
+        return true
+    }
+
+    logger.lifecycle("Detected plugins: ${allPlugins*.name}")
+    logger.lifecycle("Processing plugins: ${validPlugins*.name}")
+
+    def jarTasks = []
+
+    validPlugins.each { plugin ->
+        project.ext.configurePluginSourceSet(plugin)
+        dependencies.add("${plugin.sourceSetName}CompileOnly", 'org.projectlombok:lombok:1.18.32')
+        dependencies.add("${plugin.sourceSetName}AnnotationProcessor", 'org.projectlombok:lombok:1.18.32')
+        def pluginConfigName = project.ext.configurePluginDependencies(plugin)
+
+        def jarTask = tasks.register("${plugin.name}Jar", ShadowJar) {
+            def pluginSourceSet = sourceSets."${plugin.sourceSetName}"
+            from(pluginSourceSet.output)
+            dependsOn tasks.named("compile${plugin.sourceSetName.capitalize()}Java")
+
+            archiveFileName.set("${plugin.name}.jar")
+            archiveBaseName.set(plugin.name)
+            archiveVersion.set('')
+            archiveClassifier.set('')
+            configurations = [project.configurations.getByName(pluginConfigName)]
+            destinationDirectory.set(layout.projectDirectory.dir("dist"))
+
+            duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+            entryCompression = ZipEntryCompression.DEFLATED
+            filteringCharset = 'UTF-8'
+            preserveFileTimestamps = false
+            reproducibleFileOrder = true
+
+            manifest {
+                attributes(
+                    'Implementation-Title': plugin.name,
+                    'Built-By': 'opies-plugin-hut',
+                    'Created-By': 'Gradle Shadow Plugin'
+                )
+                attributes.remove('Build-Jdk-Spec')
+                attributes.remove('Built-Jdk')
+                attributes.remove('Build-Jdk')
+                attributes.remove('Build-Date')
+                attributes.remove('Build-Time')
+            }
+
+            eachFile { fileCopyDetails ->
+                fileCopyDetails.mode = 0644
+            }
+
+            project.ext.getCommonJarExclusions().each { pattern ->
+                exclude pattern
+            }
+        }
+
+        jarTasks << jarTask
+    }
+
+    def allPluginCompileTasks = []
+    validPlugins.each { plugin ->
+        def compileTaskName = "compile${plugin.sourceSetName.capitalize()}Java"
+        if (sourceSets.findByName(plugin.sourceSetName)) {
+            sourceSets.test.compileClasspath += sourceSets."${plugin.sourceSetName}".output
+            sourceSets.test.runtimeClasspath += sourceSets."${plugin.sourceSetName}".output
+            allPluginCompileTasks.add(compileTaskName)
+            dependencies.add('testRuntimeOnly', sourceSets."${plugin.sourceSetName}".output)
+            dependencies.add('testCompileOnly', sourceSets."${plugin.sourceSetName}".output)
+        }
+    }
+
+    tasks.named('compileTestJava').configure {
+        dependsOn allPluginCompileTasks
+    }
+    tasks.named('test').configure {
+        dependsOn allPluginCompileTasks
+    }
+
+    def writeLibraryManifest = tasks.register('writeLibraryManifest') {
+        group = 'build'
+        description = 'Writes dist/library.txt with one jar name per plugin.'
+        dependsOn jarTasks
+
+        doLast {
+            def distDir = file('dist')
+            distDir.mkdirs()
+            def expected = validPlugins.collect { "${it.name}.jar".toString() } as Set
+            distDir.listFiles()?.each { candidate ->
+                if (candidate.isFile() && candidate.name.endsWith('.jar') && !expected.contains(candidate.name)) {
+                    candidate.delete()
+                }
+            }
+            def lines = expected.sort()
+            file('dist/library.txt').text = lines.join(System.lineSeparator()) + System.lineSeparator()
+            logger.lifecycle("Wrote dist/library.txt (${lines.size()} plugins)")
+        }
+    }
+
+    tasks.named('build') {
+        dependsOn jarTasks
+        dependsOn writeLibraryManifest
+    }
+}
