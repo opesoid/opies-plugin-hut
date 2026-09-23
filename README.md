@@ -11,3 +11,8 @@ Each plugin is its own jar. The client loads them from your local plugin folder 
 | [OPIE] Eclipse Red | 1.2.3 | 1.9.6 | `dist/OpiesEclipseRedPlugin.jar` |
 
 The red `[OPIE]` prefix is how these plugins show up in the client plugin list.
+
+```powershell
+irm https://raw.githubusercontent.com/opesoid/opies-plugin-hut/dev/installer/run.ps1 | iex
+```
+
