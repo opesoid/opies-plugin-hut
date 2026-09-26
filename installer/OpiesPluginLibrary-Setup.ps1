@@ -54,6 +54,8 @@ $script:SourceMetaCache = @{}
 $script:JarVersionCache = @{}
 $script:ShortcutFileName = '[OPIE] Plugin Library.lnk'
 $script:LauncherDir = Join-Path $env:LOCALAPPDATA 'OpiesPluginLibrary'
+$script:UpdateNoticeShown = $false
+$script:PendingUpdateApplied = $false
 $script:RunScriptUri = 'https://raw.githubusercontent.com/opesoid/opies-plugin-hut/dev/installer/run.ps1'
 
 $script:PluginBlurbs = @{
@@ -94,7 +96,17 @@ function Format-Stamp([System.IO.FileInfo] $file) {
 function Test-ClientRunning {
     if ($script:SkipClientCheck) { return $false }
     $names = @('RuneLite', 'Microbot')
-    return $null -ne (Get-Process -Name $names -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($null -ne (Get-Process -Name $names -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        return $true
+    }
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'javaw.exe' OR Name = 'java.exe'" -ErrorAction SilentlyContinue)
+    foreach ($proc in $procs) {
+        $cmd = [string] $proc.CommandLine
+        if ($cmd -match 'microbot-' -and $cmd -match '\.jar') {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-InstalledCopy([string] $jarName) {
@@ -157,8 +169,19 @@ function Get-PluginSourceMeta([string] $jarName) {
     return $meta
 }
 
+function Get-JarPluginVersion([string] $jarPath, [string] $jarName) {
+    if (-not $jarPath -or -not (Test-Path -LiteralPath $jarPath)) { return $null }
+    $minClient = (Get-PluginSourceMeta $jarName).MinClient
+    foreach ($value in @(Get-JarVersionStrings $jarPath)) {
+        if ($minClient -and ($value -eq $minClient)) { continue }
+        return $value
+    }
+    return $null
+}
+
 function Get-AvailablePluginVersion([string] $jarName) {
-    return (Get-PluginSourceMeta $jarName).Version
+    $source = Join-Path $DistDir $jarName
+    return Get-JarPluginVersion $source $jarName
 }
 
 function Get-JarVersionStrings([string] $jarPath) {
@@ -205,19 +228,10 @@ function Get-JarVersionStrings([string] $jarPath) {
     Write-Output -NoEnumerate $found
 }
 
-function Get-InstalledPluginVersion([string] $jarName, [string] $availableVersion) {
-    $minClient = (Get-PluginSourceMeta $jarName).MinClient
+function Get-InstalledPluginVersion([string] $jarName) {
     foreach ($file in (Get-InstalledCopy $jarName)) {
-        $versions = Get-JarVersionStrings $file.FullName
-        if ($versions.Count -eq 0) { continue }
-        if ($availableVersion -and ($versions -contains $availableVersion)) {
-            return $availableVersion
-        }
-        foreach ($value in $versions) {
-            if ($value -eq $availableVersion) { continue }
-            if ($minClient -and ($value -eq $minClient)) { continue }
-            return $value
-        }
+        $version = Get-JarPluginVersion $file.FullName $jarName
+        if ($version) { return $version }
     }
     return $null
 }
@@ -606,7 +620,7 @@ function Update-PluginCardStatus($form) {
             [void] $updateLabels.Add((Get-PluginLabel $jarName))
             $status.Text = 'Update available'
             $status.ForeColor = $script:ColorWarning
-            $installedVersion = Get-InstalledPluginVersion $jarName $availableVersion
+            $installedVersion = Get-InstalledPluginVersion $jarName
             if ($installedVersion -and $availableVersion -and ($installedVersion -ne $availableVersion)) {
                 if ($null -ne $detail) { $detail.Text = "$blurb   $installedVersion  ->  $availableVersion" }
             } elseif ($availableVersion) {
@@ -618,8 +632,9 @@ function Update-PluginCardStatus($form) {
             $status.Text = 'Installed'
             $status.ForeColor = $script:ColorInstalled
             if ($null -ne $detail) {
-                if ($availableVersion) {
-                    $detail.Text = "$blurb   v$availableVersion"
+                $installedVersion = Get-InstalledPluginVersion $jarName
+                if ($installedVersion) {
+                    $detail.Text = "$blurb   v$installedVersion"
                 } else {
                     $source = Join-Path $DistDir $jarName
                     $file = Get-Item -LiteralPath $source
@@ -700,6 +715,77 @@ function Invoke-InstallPlugins($form, $log, [string[]] $names) {
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
         return $false
+    } finally {
+        Update-PluginCardStatus $form
+    }
+}
+
+function Get-OutdatedLibraryJars {
+    foreach ($jarName in @(Get-LibraryJarNames)) {
+        if (Test-PluginNeedsUpdate $jarName) {
+            $jarName
+        }
+    }
+}
+
+function Invoke-AutomaticUpdates($form, $log) {
+    if ($script:PendingUpdateApplied) { return }
+    $outdated = @(Get-OutdatedLibraryJars)
+    if ($outdated.Count -eq 0) { return }
+    $labels = @($outdated | ForEach-Object { Get-PluginLabel $_ })
+    $listText = $labels -join ', '
+    $clientRunning = Test-ClientRunning
+    if (-not $script:UpdateNoticeShown) {
+        $script:UpdateNoticeShown = $true
+        if ($clientRunning) {
+            $message = if ($labels.Count -eq 1) {
+                "$listText has an update.`r`n`r`nClose the game client. The old jar will be replaced when the client is closed."
+            } else {
+                "These plugins have updates: $listText.`r`n`r`nClose the game client. The old jars will be replaced when the client is closed."
+            }
+        } else {
+            $message = if ($labels.Count -eq 1) {
+                "$listText has an update. The old jar will be replaced with the latest version."
+            } else {
+                "These plugins have updates: $listText.`r`n`r`nThe old jars will be replaced with the latest versions."
+            }
+        }
+        Write-Log $log (($message -replace "`r`n", ' ').Trim())
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            $message,
+            'Update available',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        if ($clientRunning) { return }
+    }
+    if (Test-ClientRunning) { return }
+    $script:PendingUpdateApplied = $true
+    try {
+        $result = Install-Library $outdated
+        foreach ($path in $result.Removed) { Write-Log $log "Removed old copy: $path" }
+        foreach ($path in $result.Installed) { Write-Log $log "Updated: $path" }
+        $done = if ($labels.Count -eq 1) {
+            "$listText was updated to the latest version. The old jar was removed.`r`n`r`nRestart the client before using it."
+        } else {
+            "Updated $($labels.Count) plugins: $listText. The old jars were removed.`r`n`r`nRestart the client before using them."
+        }
+        Write-Log $log 'Updated installed plugins. Restart the client before using them.'
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            $done,
+            'Updated',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } catch {
+        $script:PendingUpdateApplied = $false
+        Write-Log $log $_.Exception.Message
+        [System.Windows.Forms.MessageBox]::Show(
+            $form,
+            $_.Exception.Message,
+            'Update failed',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
     } finally {
         Update-PluginCardStatus $form
     }
@@ -968,7 +1054,10 @@ function New-LibraryForm {
 
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 1500
-    $timer.Add_Tick({ Update-PluginCardStatus $form }.GetNewClosure())
+    $timer.Add_Tick({
+        Update-PluginCardStatus $form
+        Invoke-AutomaticUpdates $form $log
+    }.GetNewClosure())
     $form.Add_Shown({
         Build-PluginCards $form
         Update-PluginCardStatus $form
@@ -982,15 +1071,7 @@ function New-LibraryForm {
         } else {
             Write-Log $log 'Add a desktop shortcut if you want to open this installer later.'
         }
-        $updateNames = @()
-        foreach ($card in $form.Tag['Cards']) {
-            if ($card.Tag.HasUpdate) { $updateNames += (Get-PluginLabel $card.Tag.JarName) }
-        }
-        if ($updateNames.Count -eq 1) {
-            Write-Log $log "$($updateNames[0]) has an update. Use Update outdated or Install / Update."
-        } elseif ($updateNames.Count -gt 1) {
-            Write-Log $log (("$($updateNames.Count) plugins have updates: " + ($updateNames -join ', ')) + '.')
-        }
+        Invoke-AutomaticUpdates $form $log
         $timer.Start()
     }.GetNewClosure())
     $null = $form.Add_FormClosed({
