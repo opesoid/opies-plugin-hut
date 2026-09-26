@@ -6,7 +6,7 @@ import net.runelite.client.config.ConfigInformation;
 import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.Range;
 
-@ConfigInformation("Stand near the Hunter Guild Eclipse red spawn (1555, 3035, 2). The script hops safe members worlds, loots the wine, and banks at the Hunter Guild bank. Requires membership and Hunter Guild access.<br><br>Stop after gp is in thousands: 100 = 100k, 1000 = 1m. Each wine is treated as 700 gp.")
+@ConfigInformation("Banks at the Hunter Guild first, then shows total wealth for coins plus Eclipse red at 700 gp each. After that it hops safe members worlds, loots the spawn at 1555, 3035, 2, and banks again when the inventory fills. Requires membership and Hunter Guild access.<br><br>Stop after gp is in thousands: 100 = 100k, 1000 = 1m. If a hop hits the login limit, the script waits and logs back in.")
 @ConfigGroup(OpiesEclipseRedPlugin.CONFIG)
 public interface OpiesEclipseRedConfig extends Config {
 
@@ -106,11 +106,22 @@ public interface OpiesEclipseRedConfig extends Config {
     }
 
     @ConfigItem(
+            keyName = "hopLimitWaitMinutes",
+            name = "Hop limit wait (minutes)",
+            description = "After a hop-limit logout or a stuck login screen, wait this long before logging in again.",
+            position = 9
+    )
+    @Range(min = 1, max = 120)
+    default int hopLimitWaitMinutes() {
+        return 15;
+    }
+
+    @ConfigItem(
             keyName = "bankPin",
             name = "Bank PIN",
             description = "Your 4-digit bank PIN. Leave empty if you have no PIN. Hidden by default.",
             secret = true,
-            position = 9
+            position = 10
     )
     default String bankPin() {
         return "";
@@ -120,7 +131,7 @@ public interface OpiesEclipseRedConfig extends Config {
             keyName = "hideOverlay",
             name = "Hide overlay",
             description = "Hide the stats overlay.",
-            position = 10
+            position = 11
     )
     default boolean hideOverlay() {
         return false;

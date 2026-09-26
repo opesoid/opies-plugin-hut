@@ -248,6 +248,23 @@ function Test-DesktopShortcut {
     return (Test-Path -LiteralPath (Get-DesktopShortcutPath))
 }
 
+function Get-InstallerIconSource {
+    return (Join-Path $ScriptDir 'opes-plugin-hut.ico')
+}
+
+function Install-ShortcutIcon {
+    $source = Get-InstallerIconSource
+    if (-not (Test-Path -LiteralPath $source)) {
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $script:LauncherDir)) {
+        New-Item -ItemType Directory -Path $script:LauncherDir | Out-Null
+    }
+    $dest = Join-Path $script:LauncherDir 'opes-plugin-hut.ico'
+    Copy-Item -LiteralPath $source -Destination $dest -Force
+    return $dest
+}
+
 function Add-DesktopShortcut {
     if (-not (Test-Path -LiteralPath $script:LauncherDir)) {
         New-Item -ItemType Directory -Path $script:LauncherDir | Out-Null
@@ -267,7 +284,26 @@ function Add-DesktopShortcut {
     $shortcut.WorkingDirectory = $script:LauncherDir
     $shortcut.WindowStyle = 7
     $shortcut.Description = 'Open the [OPIE] Plugin Library installer'
-    $shortcut.IconLocation = ((Join-Path $env:SystemRoot 'System32\imageres.dll') + ',109')
+    $icon = Install-ShortcutIcon
+    if ($icon) {
+        $shortcut.IconLocation = "$icon,0"
+    } else {
+        $shortcut.IconLocation = ((Join-Path $env:SystemRoot 'System32\imageres.dll') + ',109')
+    }
+    $shortcut.Save()
+}
+
+function Update-ExistingShortcutIcon {
+    if (-not (Test-DesktopShortcut)) {
+        return
+    }
+    $icon = Install-ShortcutIcon
+    if (-not $icon) {
+        return
+    }
+    $wsh = New-Object -ComObject WScript.Shell
+    $shortcut = $wsh.CreateShortcut((Get-DesktopShortcutPath))
+    $shortcut.IconLocation = "$icon,0"
     $shortcut.Save()
 }
 
@@ -681,6 +717,10 @@ function New-LibraryForm {
     $form.ForeColor = $script:ColorText
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $form.ShowInTaskbar = $true
+    $iconPath = Get-InstallerIconSource
+    if (Test-Path -LiteralPath $iconPath) {
+        $form.Icon = New-Object System.Drawing.Icon $iconPath
+    }
     Set-ControlBuffered $form
 
     $header = New-Object System.Windows.Forms.Panel
@@ -932,6 +972,9 @@ function New-LibraryForm {
     $form.Add_Shown({
         Build-PluginCards $form
         Update-PluginCardStatus $form
+        if (Test-DesktopShortcut) {
+            Update-ExistingShortcutIcon
+        }
         Update-ShortcutLink $shortcutLink
         Write-Log $log 'Check the plugins you want, then install or update. Unchecked plugins are left alone.'
         if (Test-DesktopShortcut) {
@@ -950,7 +993,11 @@ function New-LibraryForm {
         }
         $timer.Start()
     }.GetNewClosure())
-    $null = $form.Add_FormClosed({ $timer.Stop(); $timer.Dispose() }.GetNewClosure())
+    $null = $form.Add_FormClosed({
+        $timer.Stop()
+        $timer.Dispose()
+        if ($null -ne $form.Icon) { $form.Icon.Dispose() }
+    }.GetNewClosure())
 
     return $form
 }

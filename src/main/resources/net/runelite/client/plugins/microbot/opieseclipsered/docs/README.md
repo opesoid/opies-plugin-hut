@@ -10,13 +10,16 @@ Hops safe members worlds collecting the single Eclipse red spawn on the top floo
 
 ## How it works
 
-1. Walks to the spawn tile.
-2. Picks up Eclipse red (item 29415) if it is on the tile.
-3. Hops to a random accessible members world that is not PvP, high-risk, bounty, skill-total, LMS, deadman, arena, tournament, seasonal, beta, or fresh start.
-4. Repeats until the wine threshold is reached (default 28).
-5. Banks at Hunter Guild. Config chooses resume or stop after banking.
+1. Banks at the Hunter Guild first and reads coins plus Eclipse red already in the bank. Each wine is 700 gp. The overlay shows total wealth from then on, including wines picked up before the next deposit.
+2. Walks to the spawn tile.
+3. Picks up Eclipse red (item 29415) if it is on the tile.
+4. Hops to a random accessible members world that is not PvP, high-risk, bounty, skill-total, LMS, deadman, arena, tournament, seasonal, beta, or fresh start.
+5. Repeats until the wine threshold is reached (default 28).
+6. Banks at Hunter Guild. Config chooses resume or stop after depositing. The opening bank always continues into the collect loop.
 
 Worlds recently visited are skipped for the configured cooldown so the spawn has time to exist again.
+
+A hop that only flashes the login screen is left alone. If the client stays on the login screen, or the login text says the hop limit was hit, the script waits (default 15 minutes) and logs back in. It does not stop. Banned accounts, bad credentials, and a non-member on a members world still stop.
 
 ## Config
 
@@ -26,6 +29,6 @@ Worlds recently visited are skipped for the configured cooldown so the spawn has
 - Stop after gp (in k): 100 = 100k, 1000 = 1m. Each wine is 700 gp, so 100k needs 143 wines
 - After banking: RESUME or STOP
 - World cooldown
-- Hop delay range
 - Avoid empty / overcrowded worlds
 - Max wait for wine before hopping
+- Hop limit wait (minutes)

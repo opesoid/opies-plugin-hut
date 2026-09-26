@@ -1,7 +1,10 @@
 package net.runelite.client.plugins.microbot.opieseclipsered;
 
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.GameState;
+import net.runelite.api.ItemID;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.plugins.microbot.Script;
 import net.runelite.client.plugins.microbot.util.antiban.Rs2Antiban;
@@ -14,6 +17,7 @@ import net.runelite.client.plugins.microbot.util.inventory.Rs2Inventory;
 import net.runelite.client.plugins.microbot.util.math.Rs2Random;
 import net.runelite.client.plugins.microbot.util.models.RS2Item;
 import net.runelite.client.plugins.microbot.util.player.Rs2Player;
+import net.runelite.client.plugins.microbot.util.security.LoginManager;
 import net.runelite.client.plugins.microbot.util.walker.Rs2Walker;
 import net.runelite.client.plugins.microbot.util.world.Rs2WorldUtil;
 
@@ -29,7 +33,7 @@ public class OpiesEclipseRedScript extends Script {
     static final WorldPoint WINE_TILE = new WorldPoint(1555, 3035, 2);
     private static final int MAX_WORLD_REROLLS = 30;
 
-    public volatile State state = State.TRAVEL_TO_SPAWN;
+    public volatile State state = State.BANK;
     public volatile int winesCollected;
     public volatile int hopCount;
     public volatile int currentWorld;
@@ -37,14 +41,36 @@ public class OpiesEclipseRedScript extends Script {
     public volatile int winesPerHourSnapshot;
 
     private static final long TRAVEL_TIMEOUT_MS = 120_000;
+    private static final long HOP_LAND_TIMEOUT_MS = 20_000;
+    private static final long LOGIN_ATTEMPT_GRACE_MS = 20_000;
+    private static final int LOGIN_INDEX_AUTH_FAILURE = 3;
+    private static final int LOGIN_INDEX_INVALID_CREDENTIALS = 4;
+    private static final int LOGIN_INDEX_BANNED = 14;
+    private static final int LOGIN_INDEX_NON_MEMBER = 34;
+
     private long travelStartMs = 0;
+    private boolean initialBank = true;
+    private boolean wealthReady;
+    private long bankCoins;
+    private int bankEclipse;
+    private boolean awaitingRelog;
+    private long loggedOutSinceMs;
+    private long hopLimitWaitUntilMs;
+    private boolean hopLimitLoginAttempted;
+    private long loginAttemptGraceUntilMs;
 
     private final Map<Integer, Long> worldCooldowns = new HashMap<>();
     private boolean membershipChecked;
 
     public boolean run(OpiesEclipseRedConfig config) {
         shutdown();
-        state = State.TRAVEL_TO_SPAWN;
+        state = State.BANK;
+        initialBank = true;
+        wealthReady = false;
+        bankCoins = 0;
+        bankEclipse = 0;
+        awaitingRelog = false;
+        clearLoginRecovery();
         winesCollected = 0;
         hopCount = 0;
         currentWorld = 0;
@@ -52,7 +78,7 @@ public class OpiesEclipseRedScript extends Script {
         winesPerHourSnapshot = 0;
         membershipChecked = false;
         worldCooldowns.clear();
-        Microbot.status = "Starting Eclipse Red";
+        Microbot.status = "Checking coins and Eclipse red";
 
         // Wire antiban: Hunter-style setup (fast-paced movement/collection),
         // activity set to GENERAL_COLLECTING since we are looting a spawn repeatedly.
@@ -64,6 +90,7 @@ public class OpiesEclipseRedScript extends Script {
         mainScheduledFuture = scheduledExecutorService.scheduleWithFixedDelay(() -> {
             try {
                 if (!Microbot.isLoggedIn()) {
+                    recoverLoggedOut(config);
                     return;
                 }
                 if (!super.run()) {
@@ -71,6 +98,12 @@ public class OpiesEclipseRedScript extends Script {
                 }
                 if (!ensureMember()) {
                     return;
+                }
+                clearLoginRecovery();
+                if (awaitingRelog) {
+                    awaitingRelog = false;
+                    travelStartMs = 0;
+                    state = initialBank ? State.BANK : State.TRAVEL_TO_SPAWN;
                 }
 
                 currentWorld = Microbot.getClient().getWorld();
@@ -228,17 +261,35 @@ public class OpiesEclipseRedScript extends Script {
 
         Microbot.status = "Hopping to world " + target;
         boolean hopped = Microbot.hopToWorld(target);
+        if (isLoginScreen()) {
+            awaitingRelog = true;
+            return;
+        }
         if (!hopped) {
-            // The world hopper needs a warm-up on the first call of a session — the
-            // interface hasn't been opened before so isHopping() doesn't fire in time
-            // and hopToWorld returns false after ~5s. Retry once; the interface is now
-            // initialised and the second attempt succeeds immediately.
+            // The world hopper needs a warm-up on the first call of a session. The
+            // interface has not been opened before, so isHopping() does not fire in time
+            // and hopToWorld returns false after ~5s. Retry once while still logged in.
             sleep(400);
+            if (isLoginScreen()) {
+                awaitingRelog = true;
+                return;
+            }
             hopped = Microbot.hopToWorld(target);
+            if (isLoginScreen()) {
+                awaitingRelog = true;
+                return;
+            }
             if (!hopped) {
                 Microbot.status = "Hop failed, retrying";
                 return;
             }
+        }
+
+        // Short settle: allow ground items to register (~1-2 game ticks) after world change.
+        sleep(Rs2Random.betweenInclusive(300, 500));
+        if (isLoginScreen()) {
+            awaitingRelog = true;
+            return;
         }
 
         // Record cooldown only after a confirmed successful hop.
@@ -246,11 +297,7 @@ public class OpiesEclipseRedScript extends Script {
         hopCount++;
         currentWorld = target;
 
-        // Short settle: allow ground items to register (~1-2 game ticks) after world change.
-        // This replaced the old 800-1200ms stabilisation sleep + 1000-2500ms user delay.
-        sleep(Rs2Random.betweenInclusive(300, 500));
-
-        // Antiban: natural variable pause while the player "looks around" the new world.
+        // Antiban: natural variable pause while the player looks around the new world.
         // Resolves to zero if the antiban panel has play style disabled.
         Rs2Antiban.actionCooldown();
         Rs2Antiban.takeMicroBreakByChance();
@@ -261,7 +308,7 @@ public class OpiesEclipseRedScript extends Script {
     }
 
     private void bank(OpiesEclipseRedConfig config) {
-        Microbot.status = "Banking Eclipse red";
+        Microbot.status = initialBank ? "Checking coins and Eclipse red" : "Banking Eclipse red";
         // Handle a bank PIN dialog that may appear before the bank is fully open.
         enterPinIfNeeded(config);
         if (!Rs2Bank.walkToBankAndUseBank(BankLocation.HUNTERS_GUILD)) {
@@ -274,6 +321,7 @@ public class OpiesEclipseRedScript extends Script {
         }
         Rs2Bank.depositAll(ECLIPSE_RED_ID);
         sleepUntil(() -> Rs2Inventory.count(ECLIPSE_RED_ID) == 0, 4000);
+        snapshotBankWealth();
         Rs2Bank.closeBank();
         sleepUntil(() -> !Rs2Bank.isOpen(), 3000);
 
@@ -284,6 +332,12 @@ public class OpiesEclipseRedScript extends Script {
         // Player naturally takes a short break after banking (looking at inventory, etc.).
         Rs2Antiban.takeMicroBreakByChance();
 
+        if (initialBank) {
+            initialBank = false;
+            travelStartMs = 0;
+            state = State.TRAVEL_TO_SPAWN;
+            return;
+        }
         if (reachedStopLimit(config)) {
             stopAtGoal(config);
             return;
@@ -337,6 +391,202 @@ public class OpiesEclipseRedScript extends Script {
 
     static long targetGp(OpiesEclipseRedConfig config) {
         return Math.max(0, config.stopAfterGpK()) * 1000L;
+    }
+
+    /**
+     * Bank counts are the last open-bank snapshot. Inventory counts are live so wealth
+     * moves as wines are picked up between bank trips.
+     */
+    static long wealthGp(long bankCoins, int invCoins, int bankWines, int invWines) {
+        return bankCoins + invCoins + (long) (bankWines + invWines) * WINE_VALUE_GP;
+    }
+
+    public String wealthText() {
+        if (!wealthReady) {
+            return "...";
+        }
+        int invCoins = 0;
+        int invWines = 0;
+        if (Microbot.isLoggedIn()) {
+            invCoins = Rs2Inventory.count(ItemID.COINS);
+            invWines = Rs2Inventory.count(ECLIPSE_RED_ID);
+        }
+        return formatGp(wealthGp(bankCoins, invCoins, bankEclipse, invWines));
+    }
+
+    static boolean isHopLimitText(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        String lower = text.toLowerCase();
+        return lower.contains("too many")
+                || lower.contains("hopping too quickly")
+                || lower.contains("hop too quickly");
+    }
+
+    static String formatCountdown(long remainingMs) {
+        long totalSeconds = Math.max(0, (remainingMs + 999) / 1000);
+        return (totalSeconds / 60) + ":" + String.format("%02d", totalSeconds % 60);
+    }
+
+    private void snapshotBankWealth() {
+        if (!Rs2Bank.isOpen()) {
+            return;
+        }
+        bankCoins = Rs2Bank.count(ItemID.COINS);
+        bankEclipse = Rs2Bank.count(ECLIPSE_RED_ID);
+        wealthReady = true;
+    }
+
+    private void recoverLoggedOut(OpiesEclipseRedConfig config) {
+        awaitingRelog = true;
+        LoginLook look = readLoginLook();
+        if (look.state == GameState.LOGIN_SCREEN && isFatalLogin(look.loginIndex)) {
+            stopForFatalLogin(look.loginIndex);
+            return;
+        }
+        if (look.state == GameState.LOGIN_SCREEN_AUTHENTICATOR) {
+            Microbot.status = "Waiting for authenticator";
+            return;
+        }
+        if (look.state == GameState.HOPPING || look.state == GameState.LOADING || look.state == GameState.LOGGING_IN) {
+            loggedOutSinceMs = 0;
+            Microbot.status = "Hop in progress";
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (loggedOutSinceMs == 0) {
+            loggedOutSinceMs = now;
+        }
+        boolean stuckOnLogin = look.state == GameState.LOGIN_SCREEN
+                && (isHopLimitText(look.text) || now - loggedOutSinceMs >= HOP_LAND_TIMEOUT_MS);
+        boolean stuckElsewhere = look.state != GameState.LOGIN_SCREEN
+                && now - loggedOutSinceMs >= HOP_LAND_TIMEOUT_MS;
+        if (!stuckOnLogin && !stuckElsewhere) {
+            Microbot.status = "Hop in progress";
+            return;
+        }
+
+        if (hopLimitLoginAttempted) {
+            if (now < loginAttemptGraceUntilMs) {
+                Microbot.status = "Logging in";
+                return;
+            }
+            hopLimitLoginAttempted = false;
+            hopLimitWaitUntilMs = now + hopLimitWaitMs(config);
+        }
+        if (hopLimitWaitUntilMs == 0) {
+            hopLimitWaitUntilMs = now + hopLimitWaitMs(config);
+        }
+        if (now < hopLimitWaitUntilMs) {
+            Microbot.status = "Hop limit, login in " + formatCountdown(hopLimitWaitUntilMs - now);
+            return;
+        }
+
+        hopLimitLoginAttempted = true;
+        loginAttemptGraceUntilMs = now + LOGIN_ATTEMPT_GRACE_MS;
+        hopLimitWaitUntilMs = 0;
+        int target = pickSafeWorld(config, look.world);
+        if (target <= 0) {
+            target = LoginManager.getRandomWorld(true);
+        }
+        Microbot.status = "Logging in to world " + target;
+        LoginManager.login(target);
+    }
+
+    private void stopForFatalLogin(int loginIndex) {
+        String why;
+        if (loginIndex == LOGIN_INDEX_AUTH_FAILURE) {
+            why = "Authentication failed";
+        } else if (loginIndex == LOGIN_INDEX_INVALID_CREDENTIALS) {
+            why = "Invalid credentials";
+        } else if (loginIndex == LOGIN_INDEX_BANNED) {
+            why = "Account is banned";
+        } else if (loginIndex == LOGIN_INDEX_NON_MEMBER) {
+            why = "Members world required";
+        } else {
+            why = "Login failed";
+        }
+        Microbot.status = why + ". Stopping.";
+        log.warn("{} (login index {}). Stopping.", why, loginIndex);
+        shutdown();
+    }
+
+    private static boolean isFatalLogin(int loginIndex) {
+        return loginIndex == LOGIN_INDEX_AUTH_FAILURE
+                || loginIndex == LOGIN_INDEX_INVALID_CREDENTIALS
+                || loginIndex == LOGIN_INDEX_BANNED
+                || loginIndex == LOGIN_INDEX_NON_MEMBER;
+    }
+
+    private static long hopLimitWaitMs(OpiesEclipseRedConfig config) {
+        return Math.max(1, config.hopLimitWaitMinutes()) * 60_000L;
+    }
+
+    private void clearLoginRecovery() {
+        loggedOutSinceMs = 0;
+        hopLimitWaitUntilMs = 0;
+        hopLimitLoginAttempted = false;
+        loginAttemptGraceUntilMs = 0;
+    }
+
+    private boolean isLoginScreen() {
+        GameState state = gameState();
+        return state == GameState.LOGIN_SCREEN || state == GameState.LOGIN_SCREEN_AUTHENTICATOR;
+    }
+
+    private GameState gameState() {
+        try {
+            return Microbot.getClientThread().runOnClientThreadOptional(
+                    () -> Microbot.getClient().getGameState()).orElse(GameState.UNKNOWN);
+        } catch (Exception ex) {
+            return GameState.UNKNOWN;
+        }
+    }
+
+    private LoginLook readLoginLook() {
+        try {
+            return Microbot.getClientThread().runOnClientThreadOptional(() -> {
+                GameState state = Microbot.getClient().getGameState();
+                int loginIndex = state == GameState.LOGIN_SCREEN ? Microbot.getClient().getLoginIndex() : -1;
+                int world = Microbot.getClient().getWorld();
+                StringBuilder text = new StringBuilder();
+                Widget[] roots = Microbot.getClient().getWidgetRoots();
+                if (roots != null) {
+                    for (Widget root : roots) {
+                        appendWidgetText(root, text, 0);
+                    }
+                }
+                return new LoginLook(state, loginIndex, world, text.toString());
+            }).orElse(LoginLook.UNKNOWN);
+        } catch (Exception ex) {
+            log.debug("Could not read the login screen", ex);
+            return LoginLook.UNKNOWN;
+        }
+    }
+
+    private static void appendWidgetText(Widget widget, StringBuilder text, int depth) {
+        if (widget == null || depth > 6 || text.length() > 2000) {
+            return;
+        }
+        try {
+            if (widget.isHidden()) {
+                return;
+            }
+            String value = widget.getText();
+            if (value != null && !value.isEmpty()) {
+                text.append(value).append('\n');
+            }
+            Widget[] children = widget.getChildren();
+            if (children != null) {
+                for (Widget child : children) {
+                    appendWidgetText(child, text, depth + 1);
+                }
+            }
+        } catch (Exception ignored) {
+            // Login-screen widgets are not always readable.
+        }
     }
 
     static String formatGp(long gp) {
@@ -425,5 +675,21 @@ public class OpiesEclipseRedScript extends Script {
         LOOT,
         HOP,
         BANK
+    }
+
+    private static final class LoginLook {
+        static final LoginLook UNKNOWN = new LoginLook(GameState.UNKNOWN, -1, -1, "");
+
+        final GameState state;
+        final int loginIndex;
+        final int world;
+        final String text;
+
+        LoginLook(GameState state, int loginIndex, int world, String text) {
+            this.state = state;
+            this.loginIndex = loginIndex;
+            this.world = world;
+            this.text = text == null ? "" : text;
+        }
     }
 }

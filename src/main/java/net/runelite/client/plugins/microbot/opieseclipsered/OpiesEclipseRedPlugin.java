@@ -24,7 +24,7 @@ import java.time.Instant;
 )
 @Slf4j
 public class OpiesEclipseRedPlugin extends Plugin {
-    public static final String version = "1.2.3";
+    public static final String version = "1.2.4";
     static final String CONFIG = "opieseclipsered";
 
     public Instant scriptStartTime;

@@ -31,7 +31,7 @@ public class OpiesEclipseRedOverlay extends OverlayPanel {
             return null;
         }
         try {
-            panelComponent.setPreferredSize(new Dimension(220, 200));
+            panelComponent.setPreferredSize(new Dimension(220, 220));
             panelComponent.getChildren().add(TitleComponent.builder()
                     .text("Eclipse Red")
                     .color(Color.RED)
@@ -48,6 +48,11 @@ public class OpiesEclipseRedOverlay extends OverlayPanel {
             panelComponent.getChildren().add(LineComponent.builder()
                     .left("State")
                     .right(plugin.script.state == null ? "-" : plugin.script.state.name())
+                    .build());
+            panelComponent.getChildren().add(LineComponent.builder()
+                    .left("Wealth")
+                    .right(plugin.script.wealthText())
+                    .rightColor(Color.YELLOW)
                     .build());
 
             // wines/hr is recalculated once per bank trip for accuracy (not every render tick)
